@@ -86,20 +86,24 @@ func run(cmd *cobra.Command, args []string) {
 		o.DisableLogOutputChecksumValidationSkipped = true
 	})
 
-	// determine shard prefixes up to 4 levels deep
+	// discover and list shards
 	fmt.Println("Discovering shard prefixes...")
 	prefixes := getShardPrefixes(ctx, s3cli, bucket, prefix, 4)
-	if len(prefixes) > 1 {
-		fmt.Printf("Found %d shard prefixes, listing in parallel...\n", len(prefixes))
+	nShards := len(prefixes)
+	if nShards > 1 {
+		fmt.Printf("Found %d shard prefixes.\n", nShards)
 	} else {
-		fmt.Println("Single shard detected, falling back to single listing prefix")
+		fmt.Println("Single shard detected or no deeper prefixes.")
 		prefixes = []string{prefix}
+		nShards = 1
 	}
 
-	// aggregate keys across prefixes
+	// parallel listing with progress
+	var shardCount int64
 	var allKeys []types.Object
 	var lm sync.Mutex
 	var lwg sync.WaitGroup
+	fmt.Printf("Listing shards: 0/%d completed...\n", nShards)
 	for _, p := range prefixes {
 		lwg.Add(1)
 		go func(pref string) {
@@ -115,9 +119,13 @@ func run(cmd *cobra.Command, args []string) {
 				allKeys = append(allKeys, page.Contents...)
 				lm.Unlock()
 			}
+			cur := atomic.AddInt64(&shardCount, 1)
+			fmt.Printf("\rListing shards: %d/%d completed", cur, nShards)
 		}(p)
 	}
 	lwg.Wait()
+	fmt.Println()
+
 	total := int64(len(allKeys))
 	fmt.Printf("Total log files: %d\n", total)
 
@@ -151,7 +159,7 @@ func run(cmd *cobra.Command, args []string) {
 	wg.Wait()
 	fmt.Println()
 
-	// output
+	// output results
 	keysAct := sortedKeys(actions)
 	fmt.Printf("\nActions by %s:\n", identity)
 	for _, a := range keysAct {
@@ -170,8 +178,6 @@ func run(cmd *cobra.Command, args []string) {
 }
 
 // getShardPrefixes lists common prefixes up to 'levels' deep
-type shardFetcher func(context.Context, *s3.Client, string, string) ([]string, error)
-
 func getShardPrefixes(ctx context.Context, cli *s3.Client, bucket, base string, levels int) []string {
 	prefixes := []string{base}
 	for lvl := 0; lvl < levels; lvl++ {
@@ -185,11 +191,9 @@ func getShardPrefixes(ctx context.Context, cli *s3.Client, bucket, base string, 
 				next = append(next, *cp.Prefix)
 			}
 		}
-		// if no deeper prefixes, stop drilling
 		if len(next) == 0 {
 			break
 		}
-		// move to next level
 		prefixes = next
 	}
 	return prefixes
