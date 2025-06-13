@@ -28,6 +28,18 @@ var (
 	outfile  string
 )
 
+// convert sts ARNs to iam ARNs and strips session suffixes
+func normalizeArn(raw string) string {
+	arn := strings.Replace(raw, "arn:aws:sts::", "arn:aws:iam::", 1)
+	// handle assumed-role vs role
+	arn = strings.Replace(arn, ":assumed-role/", ":role/", 1)
+	// strip any session or path after first /
+	if idx := strings.Index(arn, "/"); idx != -1 {
+		arn = arn[:idx]
+	}
+	return arn
+}
+
 func main() {
 	root := &cobra.Command{
 		Use:   "cloudtrail2iam",
@@ -62,8 +74,8 @@ func run(cmd *cobra.Command, args []string) {
    ░      ░   ░ ░   ░        ░░   ░   ░   ▒    ▒ ░  ░ ░   ░  ░  ░  
    ░  ░         ░             ░           ░  ░ ░      ░  ░      ░  
                                                                   `)
-
 	ctx := context.Background()
+
 	fmt.Println("Loading AWS config...")
 	cfg, err := config.LoadDefaultConfig(ctx, config.WithSharedConfigProfile(profile))
 	if err != nil {
@@ -77,7 +89,7 @@ func run(cmd *cobra.Command, args []string) {
 		if err != nil {
 			fail(err)
 		}
-		identity = *res.Arn
+		identity = normalizeArn(*res.Arn)
 		fmt.Printf("Using identity: %s\n", identity)
 	}
 
@@ -86,7 +98,7 @@ func run(cmd *cobra.Command, args []string) {
 		o.DisableLogOutputChecksumValidationSkipped = true
 	})
 
-	// discover and list shards
+	// discover shard prefixes
 	fmt.Println("Discovering shard prefixes...")
 	prefixes := getShardPrefixes(ctx, s3cli, bucket, prefix, 4)
 	nShards := len(prefixes)
@@ -98,7 +110,7 @@ func run(cmd *cobra.Command, args []string) {
 		nShards = 1
 	}
 
-	// parallel listing with progress
+	// parallel listing
 	var shardCount int64
 	var allKeys []types.Object
 	var lm sync.Mutex
@@ -108,7 +120,7 @@ func run(cmd *cobra.Command, args []string) {
 		lwg.Add(1)
 		go func(pref string) {
 			defer lwg.Done()
-			paginator := s3.NewListObjectsV2Paginator(s3cli, &s3.ListObjectsV2Input{Bucket: &bucket, Prefix: &pref})
+			paginator := s3.NewListObjectsV2Paginator(s3cli, &s3.ListObjectsV2Input{Bucket: aws.String(bucket), Prefix: aws.String(pref)})
 			for paginator.HasMorePages() {
 				page, err := paginator.NextPage(ctx)
 				if err != nil {
@@ -148,7 +160,7 @@ func run(cmd *cobra.Command, args []string) {
 		go func() {
 			defer wg.Done()
 			for obj := range jobs {
-				process(ctx, s3cli, &bucket, *obj.Key, identity, actions, &mu, secrets)
+				process(ctx, s3cli, bucket, *obj.Key, identity, actions, &mu, secrets)
 				cur := atomic.AddInt64(&processed, 1)
 				if cur%100 == 0 || cur == total {
 					fmt.Printf("\rProcessed %d/%d logs", cur, total)
@@ -159,7 +171,7 @@ func run(cmd *cobra.Command, args []string) {
 	wg.Wait()
 	fmt.Println()
 
-	// output results
+	// output
 	keysAct := sortedKeys(actions)
 	fmt.Printf("\nActions by %s:\n", identity)
 	for _, a := range keysAct {
@@ -183,7 +195,7 @@ func getShardPrefixes(ctx context.Context, cli *s3.Client, bucket, base string, 
 	for lvl := 0; lvl < levels; lvl++ {
 		var next []string
 		for _, p := range prefixes {
-			resp, err := cli.ListObjectsV2(ctx, &s3.ListObjectsV2Input{Bucket: &bucket, Prefix: &p, Delimiter: aws.String("/")})
+			resp, err := cli.ListObjectsV2(ctx, &s3.ListObjectsV2Input{Bucket: aws.String(bucket), Prefix: aws.String(p), Delimiter: aws.String("/")})
 			if err != nil {
 				fail(err)
 			}
@@ -208,8 +220,8 @@ func sortedKeys(m map[string]string) []string {
 	return ks
 }
 
-func process(ctx context.Context, cli *s3.Client, bucket *string, key, identity string, actions map[string]string, mu *sync.Mutex, secrets map[string]struct{}) {
-	r, err := cli.GetObject(ctx, &s3.GetObjectInput{Bucket: bucket, Key: &key})
+func process(ctx context.Context, cli *s3.Client, bucket, key, identity string, actions map[string]string, mu *sync.Mutex, secrets map[string]struct{}) {
+	r, err := cli.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String(bucket), Key: aws.String(key)})
 	if err != nil {
 		return
 	}
@@ -242,9 +254,8 @@ func process(ctx context.Context, cli *s3.Client, bucket *string, key, identity 
 		if err := json.Unmarshal(raw, &ev); err != nil {
 			continue
 		}
-		arn := strings.Replace(strings.Replace(ev.UserIdentity.Arn, "arn:aws:sts::", "arn:aws:iam::", 1), "/assumed-role", "/role", 1)
-		arn = strings.SplitN(arn, "/", 2)[0]
-		if arn != identity || ev.ErrorCode != nil {
+		norm := normalizeArn(ev.UserIdentity.Arn)
+		if norm != identity || ev.ErrorCode != nil {
 			continue
 		}
 		action := strings.Split(ev.EventSource, ".")[0] + ":" + ev.EventName
