@@ -24,6 +24,7 @@ var (
 	profile  string
 	threads  int
 	identity string
+	outfile  string
 )
 
 func main() {
@@ -38,6 +39,7 @@ func main() {
 	root.Flags().StringVar(&profile, "profile", "", "AWS CLI profile to use")
 	root.Flags().IntVar(&threads, "threads", 10, "Number of workers")
 	root.Flags().StringVar(&identity, "identity", "", "Filter by identity ARN (default: caller identity)")
+	root.Flags().StringVar(&outfile, "output", "", "Write results to this file (optional)")
 	root.MarkFlagRequired("bucket")
 	root.MarkFlagRequired("prefix")
 
@@ -49,33 +51,37 @@ func main() {
 
 func run(cmd *cobra.Command, args []string) {
 	ctx := context.Background()
+	fmt.Println("Loading AWS config...")
 	cfg, err := config.LoadDefaultConfig(ctx, config.WithSharedConfigProfile(profile))
 	if err != nil {
 		fail(err)
 	}
 
 	if identity == "" {
+		fmt.Println("Retrieving caller identity...")
 		stscli := sts.NewFromConfig(cfg)
 		res, err := stscli.GetCallerIdentity(ctx, &sts.GetCallerIdentityInput{})
 		if err != nil {
 			fail(err)
 		}
 		identity = *res.Arn
+		fmt.Printf("Using identity: %s\n", identity)
 	}
 
 	s3cli := s3.NewFromConfig(cfg)
 
-	// list objects
+	fmt.Println("Listing objects in bucket...")
 	keys := listKeys(ctx, s3cli, bucket, prefix)
 	total := int64(len(keys))
-	var processed int64
+	fmt.Printf("Found %d log files\n", total)
 
-	// results
+	// prepare
+	var processed int64
 	actions := make(map[string]string)
 	var mu sync.Mutex
 	secrets := make(map[string]struct{})
 
-	// worker pool
+	fmt.Printf("Starting %d workers...\n", threads)
 	jobs := make(chan types.Object, len(keys))
 	for _, obj := range keys {
 		jobs <- obj
@@ -85,30 +91,32 @@ func run(cmd *cobra.Command, args []string) {
 	var wg sync.WaitGroup
 	for i := 0; i < threads; i++ {
 		wg.Add(1)
-		go func() {
+		go func(id int) {
 			defer wg.Done()
 			for obj := range jobs {
 				process(ctx, s3cli, bucket, *obj.Key, identity, actions, &mu, secrets)
 				cur := atomic.AddInt64(&processed, 1)
-				fmt.Printf("\rProcessed %d/%d logs", cur, total)
+				if cur%100 == 0 || cur == total {
+					fmt.Printf("\rProcessed %d/%d logs", cur, total)
+				}
 			}
-		}()
+		}(i)
 	}
 	wg.Wait()
 	fmt.Println()
 
-	// print actions
+	// prepare output lines
 	keysAct := make([]string, 0, len(actions))
 	for a := range actions {
 		keysAct = append(keysAct, a)
 	}
 	sort.Strings(keysAct)
+
+	// console output
 	fmt.Printf("\nActions by %s:\n", identity)
 	for _, a := range keysAct {
 		fmt.Printf("- %s (%s)\n", a, actions[a])
 	}
-
-	// print potential secrets
 	if len(secrets) > 0 {
 		fmt.Println("\nPotential Secrets Manager secrets:")
 		list := make([]string, 0, len(secrets))
@@ -119,6 +127,28 @@ func run(cmd *cobra.Command, args []string) {
 		for _, s := range list {
 			fmt.Printf("- %s\n", s)
 		}
+	}
+
+	// file output
+	if outfile != "" {
+		fmt.Printf("Writing results to %s...\n", outfile)
+		f, err := os.Create(outfile)
+		if err != nil {
+			fail(err)
+		}
+		defer f.Close()
+
+		fmt.Fprintf(f, "Actions by %s:\n", identity)
+		for _, a := range keysAct {
+			fmt.Fprintf(f, "- %s (%s)\n", a, actions[a])
+		}
+		if len(secrets) > 0 {
+			fmt.Fprintln(f, "\nPotential Secrets Manager secrets:")
+			for _, s := range secretsList(secrets) {
+				fmt.Fprintf(f, "- %s\n", s)
+			}
+		}
+		fmt.Println("Done.")
 	}
 }
 
@@ -175,10 +205,7 @@ func process(ctx context.Context, cli *s3.Client, bucket, key, identity string,
 		}
 		arn := strings.Replace(strings.Replace(r.UserIdentity.Arn, "arn:aws:sts::", "arn:aws:iam::", 1), "/assumed-role", "/role", 1)
 		arn = strings.SplitN(arn, "/", 2)[0]
-		if arn != identity {
-			continue
-		}
-		if r.ErrorCode != nil {
+		if arn != identity || r.ErrorCode != nil {
 			continue
 		}
 		action := strings.Split(r.EventSource, ".")[0] + ":" + r.EventName
@@ -188,7 +215,6 @@ func process(ctx context.Context, cli *s3.Client, bucket, key, identity string,
 		}
 		mu.Unlock()
 
-		// detect secrets manager usage
 		if strings.Contains(r.EventSource, "secretsmanager") && r.EventName == "GetSecretValue" {
 			if id, ok := r.RequestParameters["secretId"].(string); ok {
 				mu.Lock()
@@ -197,6 +223,15 @@ func process(ctx context.Context, cli *s3.Client, bucket, key, identity string,
 			}
 		}
 	}
+}
+
+func secretsList(m map[string]struct{}) []string {
+	list := make([]string, 0, len(m))
+	for s := range m {
+		list = append(list, s)
+	}
+	sort.Strings(list)
+	return list
 }
 
 func fail(err error) {
