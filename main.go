@@ -68,14 +68,16 @@ func run(cmd *cobra.Command, args []string) {
 		fmt.Printf("Using identity: %s\n", identity)
 	}
 
-	s3cli := s3.NewFromConfig(cfg)
+	// instantiate S3 client with checksum-warning suppression
+	s3cli := s3.NewFromConfig(cfg, func(o *s3.Options) {
+		o.DisableLogOutputChecksumValidationSkipped = true
+	})
 
 	fmt.Println("Listing objects in bucket...")
 	keys := listKeys(ctx, s3cli, bucket, prefix)
 	total := int64(len(keys))
 	fmt.Printf("Found %d log files\n", total)
 
-	// prepare
 	var processed int64
 	actions := make(map[string]string)
 	var mu sync.Mutex
@@ -105,31 +107,23 @@ func run(cmd *cobra.Command, args []string) {
 	wg.Wait()
 	fmt.Println()
 
-	// prepare output lines
 	keysAct := make([]string, 0, len(actions))
 	for a := range actions {
 		keysAct = append(keysAct, a)
 	}
 	sort.Strings(keysAct)
 
-	// console output
 	fmt.Printf("\nActions by %s:\n", identity)
 	for _, a := range keysAct {
 		fmt.Printf("- %s (%s)\n", a, actions[a])
 	}
 	if len(secrets) > 0 {
 		fmt.Println("\nPotential Secrets Manager secrets:")
-		list := make([]string, 0, len(secrets))
-		for s := range secrets {
-			list = append(list, s)
-		}
-		sort.Strings(list)
-		for _, s := range list {
+		for _, s := range secretsList(secrets) {
 			fmt.Printf("- %s\n", s)
 		}
 	}
 
-	// file output
 	if outfile != "" {
 		fmt.Printf("Writing results to %s...\n", outfile)
 		f, err := os.Create(outfile)
