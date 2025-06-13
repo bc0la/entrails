@@ -21,6 +21,12 @@ Enumerate actions and principals via readable CloudTrail buckets using a comprom
 - AWS CLI configured with appropriate credentials
 - Access to S3 buckets containing CloudTrail logs
 
+### Quick install
+
+```bash
+go install github.com/bc0la/entrails@latest
+```
+
 ### Build from source
 
 ```bash
