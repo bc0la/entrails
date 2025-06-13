@@ -38,7 +38,7 @@ func main() {
 	root.Flags().StringVar(&bucket, "bucket", "", "S3 bucket name (e.g. AWSLogs/<acc-id>/CloudTrail/)")
 	root.Flags().StringVar(&prefix, "prefix", "", "S3 prefix for CloudTrail logs")
 	root.Flags().StringVar(&profile, "profile", "", "AWS CLI profile to use")
-	root.Flags().IntVar(&threads, "threads", 10, "Number of workers")
+	root.Flags().IntVar(&threads, "threads", 10, "Number of workers for listing shards and processing logs")
 	root.Flags().StringVar(&identity, "identity", "", "Filter by identity ARN (default: caller identity)")
 	root.Flags().StringVar(&outfile, "output", "", "Write results to this file (optional)")
 	root.MarkFlagRequired("bucket")
@@ -86,9 +86,9 @@ func run(cmd *cobra.Command, args []string) {
 		o.DisableLogOutputChecksumValidationSkipped = true
 	})
 
-	// determine shard prefixes up to 2 levels deep
+	// determine shard prefixes up to 4 levels deep
 	fmt.Println("Discovering shard prefixes...")
-	prefixes := getShardPrefixes(ctx, s3cli, bucket, prefix, 2)
+	prefixes := getShardPrefixes(ctx, s3cli, bucket, prefix, 4)
 	if len(prefixes) > 1 {
 		fmt.Printf("Found %d shard prefixes, listing in parallel...\n", len(prefixes))
 	} else {
@@ -96,7 +96,7 @@ func run(cmd *cobra.Command, args []string) {
 		prefixes = []string{prefix}
 	}
 
-	// aggregate keys
+	// aggregate keys across prefixes
 	var allKeys []types.Object
 	var lm sync.Mutex
 	var lwg sync.WaitGroup
@@ -121,7 +121,7 @@ func run(cmd *cobra.Command, args []string) {
 	total := int64(len(allKeys))
 	fmt.Printf("Total log files: %d\n", total)
 
-	// process
+	// process logs
 	var processed int64
 	actions := make(map[string]string)
 	var mu sync.Mutex
