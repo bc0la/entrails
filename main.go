@@ -169,12 +169,14 @@ func run(cmd *cobra.Command, args []string) {
 	}
 }
 
-// getShardPrefixes lists common prefixes up to 'levels'
+// getShardPrefixes lists common prefixes up to 'levels' deep
+type shardFetcher func(context.Context, *s3.Client, string, string) ([]string, error)
+
 func getShardPrefixes(ctx context.Context, cli *s3.Client, bucket, base string, levels int) []string {
-	current := []string{base}
+	prefixes := []string{base}
 	for lvl := 0; lvl < levels; lvl++ {
 		var next []string
-		for _, p := range current {
+		for _, p := range prefixes {
 			resp, err := cli.ListObjectsV2(ctx, &s3.ListObjectsV2Input{Bucket: &bucket, Prefix: &p, Delimiter: aws.String("/")})
 			if err != nil {
 				fail(err)
@@ -183,12 +185,14 @@ func getShardPrefixes(ctx context.Context, cli *s3.Client, bucket, base string, 
 				next = append(next, *cp.Prefix)
 			}
 		}
-		if len(next) > 1 {
-			return next
+		// if no deeper prefixes, stop drilling
+		if len(next) == 0 {
+			break
 		}
-		current = next
+		// move to next level
+		prefixes = next
 	}
-	return current
+	return prefixes
 }
 
 func sortedKeys(m map[string]string) []string {
