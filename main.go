@@ -38,7 +38,7 @@ func main() {
 	root.Flags().StringVar(&bucket, "bucket", "", "S3 bucket name (e.g. AWSLogs/<acc-id>/CloudTrail/)")
 	root.Flags().StringVar(&prefix, "prefix", "", "S3 prefix for CloudTrail logs")
 	root.Flags().StringVar(&profile, "profile", "", "AWS CLI profile to use")
-	root.Flags().IntVar(&threads, "threads", 10, "Number of workers for processing logs and listing shards")
+	root.Flags().IntVar(&threads, "threads", 10, "Number of workers")
 	root.Flags().StringVar(&identity, "identity", "", "Filter by identity ARN (default: caller identity)")
 	root.Flags().StringVar(&outfile, "output", "", "Write results to this file (optional)")
 	root.MarkFlagRequired("bucket")
@@ -62,6 +62,7 @@ func run(cmd *cobra.Command, args []string) {
    ░      ░   ░ ░   ░        ░░   ░   ░   ▒    ▒ ░  ░ ░   ░  ░  ░  
    ░  ░         ░             ░           ░  ░ ░      ░  ░      ░  
                                                                   `)
+
 	ctx := context.Background()
 	fmt.Println("Loading AWS config...")
 	cfg, err := config.LoadDefaultConfig(ctx, config.WithSharedConfigProfile(profile))
@@ -85,21 +86,50 @@ func run(cmd *cobra.Command, args []string) {
 		o.DisableLogOutputChecksumValidationSkipped = true
 	})
 
-	// Parallel listing by shard prefixes
-	fmt.Println("Discovering shards under prefix...")
-	keys := listKeysParallel(ctx, s3cli, bucket, prefix, threads)
-	total := int64(len(keys))
-	fmt.Printf("Found %d log files across shards\n", total)
+	// determine shard prefixes up to 2 levels deep
+	fmt.Println("Discovering shard prefixes...")
+	prefixes := getShardPrefixes(ctx, s3cli, bucket, prefix, 2)
+	if len(prefixes) > 1 {
+		fmt.Printf("Found %d shard prefixes, listing in parallel...\n", len(prefixes))
+	} else {
+		fmt.Println("Single shard detected, falling back to single listing prefix")
+		prefixes = []string{prefix}
+	}
 
-	// Process logs with worker pool
+	// aggregate keys
+	var allKeys []types.Object
+	var lm sync.Mutex
+	var lwg sync.WaitGroup
+	for _, p := range prefixes {
+		lwg.Add(1)
+		go func(pref string) {
+			defer lwg.Done()
+			paginator := s3.NewListObjectsV2Paginator(s3cli, &s3.ListObjectsV2Input{Bucket: &bucket, Prefix: &pref})
+			for paginator.HasMorePages() {
+				page, err := paginator.NextPage(ctx)
+				if err != nil {
+					fmt.Fprintln(os.Stderr, "list error:", err)
+					return
+				}
+				lm.Lock()
+				allKeys = append(allKeys, page.Contents...)
+				lm.Unlock()
+			}
+		}(p)
+	}
+	lwg.Wait()
+	total := int64(len(allKeys))
+	fmt.Printf("Total log files: %d\n", total)
+
+	// process
 	var processed int64
 	actions := make(map[string]string)
 	var mu sync.Mutex
 	secrets := make(map[string]struct{})
 
 	fmt.Printf("Starting %d workers for log processing...\n", threads)
-	jobs := make(chan types.Object, len(keys))
-	for _, obj := range keys {
+	jobs := make(chan types.Object, total)
+	for _, obj := range allKeys {
 		jobs <- obj
 	}
 	close(jobs)
@@ -107,21 +137,21 @@ func run(cmd *cobra.Command, args []string) {
 	var wg sync.WaitGroup
 	for i := 0; i < threads; i++ {
 		wg.Add(1)
-		go func(id int) {
+		go func() {
 			defer wg.Done()
 			for obj := range jobs {
-				process(ctx, s3cli, bucket, *obj.Key, identity, actions, &mu, secrets)
+				process(ctx, s3cli, &bucket, *obj.Key, identity, actions, &mu, secrets)
 				cur := atomic.AddInt64(&processed, 1)
 				if cur%100 == 0 || cur == total {
 					fmt.Printf("\rProcessed %d/%d logs", cur, total)
 				}
 			}
-		}(i)
+		}()
 	}
 	wg.Wait()
 	fmt.Println()
 
-	// Output results
+	// output
 	keysAct := sortedKeys(actions)
 	fmt.Printf("\nActions by %s:\n", identity)
 	for _, a := range keysAct {
@@ -139,58 +169,28 @@ func run(cmd *cobra.Command, args []string) {
 	}
 }
 
-// listKeysParallel shards listing across common prefixes under prefix
-func listKeysParallel(ctx context.Context, cli *s3.Client, bucket, prefix string, shards int) []types.Object {
-	// first list common prefixes at one delimiter level
-	input := &s3.ListObjectsV2Input{Bucket: &bucket, Prefix: &prefix, Delimiter: aws.String("/")}
-	resp, err := cli.ListObjectsV2(ctx, input)
-	if err != nil {
-		fail(err)
-	}
-	var prefixes []string
-	for _, cp := range resp.CommonPrefixes {
-		prefixes = append(prefixes, *cp.Prefix)
-	}
-	if len(prefixes) == 0 {
-		// fallback to regular listing
-		return listKeys(ctx, cli, bucket, prefix)
-	}
-	fmt.Printf("Found %d shard prefixes, listing in parallel...\n", len(prefixes))
-
-	// worker pool for shards
-	jobs := make(chan string, len(prefixes))
-	for _, p := range prefixes {
-		jobs <- p
-	}
-	close(jobs)
-
-	var mu sync.Mutex
-	var all []types.Object
-	var wg sync.WaitGroup
-	for i := 0; i < shards; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for shard := range jobs {
-				p := s3.NewListObjectsV2Paginator(cli, &s3.ListObjectsV2Input{Bucket: &bucket, Prefix: &shard})
-				for p.HasMorePages() {
-					page, err := p.NextPage(ctx)
-					if err != nil {
-						fmt.Fprintln(os.Stderr, "shard list error:", err)
-						return
-					}
-					mu.Lock()
-					all = append(all, page.Contents...)
-					mu.Unlock()
-				}
+// getShardPrefixes lists common prefixes up to 'levels'
+func getShardPrefixes(ctx context.Context, cli *s3.Client, bucket, base string, levels int) []string {
+	current := []string{base}
+	for lvl := 0; lvl < levels; lvl++ {
+		var next []string
+		for _, p := range current {
+			resp, err := cli.ListObjectsV2(ctx, &s3.ListObjectsV2Input{Bucket: &bucket, Prefix: &p, Delimiter: aws.String("/")})
+			if err != nil {
+				fail(err)
 			}
-		}()
+			for _, cp := range resp.CommonPrefixes {
+				next = append(next, *cp.Prefix)
+			}
+		}
+		if len(next) > 1 {
+			return next
+		}
+		current = next
 	}
-	wg.Wait()
-	return all
+	return current
 }
 
-// sortedKeys returns sorted action names
 func sortedKeys(m map[string]string) []string {
 	ks := make([]string, 0, len(m))
 	for k := range m {
@@ -200,29 +200,14 @@ func sortedKeys(m map[string]string) []string {
 	return ks
 }
 
-// listKeys is fallback single-threaded
-func listKeys(ctx context.Context, cli *s3.Client, bucket, prefix string) []types.Object {
-	var all []types.Object
-	p := s3.NewListObjectsV2Paginator(cli, &s3.ListObjectsV2Input{Bucket: &bucket, Prefix: &prefix})
-	for p.HasMorePages() {
-		page, err := p.NextPage(ctx)
-		if err != nil {
-			fail(err)
-		}
-		all = append(all, page.Contents...)
-	}
-	return all
-}
-
-func process(ctx context.Context, cli *s3.Client, bucket, key, identity string,
-	actions map[string]string, mu *sync.Mutex, secrets map[string]struct{}) {
-	resp, err := cli.GetObject(ctx, &s3.GetObjectInput{Bucket: &bucket, Key: &key})
+func process(ctx context.Context, cli *s3.Client, bucket *string, key, identity string, actions map[string]string, mu *sync.Mutex, secrets map[string]struct{}) {
+	r, err := cli.GetObject(ctx, &s3.GetObjectInput{Bucket: bucket, Key: &key})
 	if err != nil {
 		return
 	}
-	defer resp.Body.Close()
+	defer r.Body.Close()
 
-	gz, err := gzip.NewReader(resp.Body)
+	gz, err := gzip.NewReader(r.Body)
 	if err != nil {
 		return
 	}
@@ -236,7 +221,7 @@ func process(ctx context.Context, cli *s3.Client, bucket, key, identity string,
 	}
 
 	for _, raw := range wrapper.Records {
-		var r struct {
+		var ev struct {
 			EventTime    string  `json:"eventTime"`
 			EventSource  string  `json:"eventSource"`
 			EventName    string  `json:"eventName"`
@@ -246,25 +231,25 @@ func process(ctx context.Context, cli *s3.Client, bucket, key, identity string,
 			} `json:"userIdentity"`
 			RequestParameters map[string]interface{} `json:"requestParameters"`
 		}
-		if err := json.Unmarshal(raw, &r); err != nil {
+		if err := json.Unmarshal(raw, &ev); err != nil {
 			continue
 		}
-		arn := strings.Replace(strings.Replace(r.UserIdentity.Arn, "arn:aws:sts::", "arn:aws:iam::", 1), "/assumed-role", "/role", 1)
+		arn := strings.Replace(strings.Replace(ev.UserIdentity.Arn, "arn:aws:sts::", "arn:aws:iam::", 1), "/assumed-role", "/role", 1)
 		arn = strings.SplitN(arn, "/", 2)[0]
-		if arn != identity || r.ErrorCode != nil {
+		if arn != identity || ev.ErrorCode != nil {
 			continue
 		}
-		action := strings.Split(r.EventSource, ".")[0] + ":" + r.EventName
+		action := strings.Split(ev.EventSource, ".")[0] + ":" + ev.EventName
 		mu.Lock()
-		if prev, ok := actions[action]; !ok || r.EventTime > prev {
-			actions[action] = r.EventTime
+		if prev, ok := actions[action]; !ok || ev.EventTime > prev {
+			actions[action] = ev.EventTime
 		}
 		mu.Unlock()
 
-		if strings.Contains(r.EventSource, "secretsmanager") && r.EventName == "GetSecretValue" {
-			if id, ok := r.RequestParameters["secretId"].(string); ok {
+		if strings.Contains(ev.EventSource, "secretsmanager") && ev.EventName == "GetSecretValue" {
+			if sid, ok := ev.RequestParameters["secretId"].(string); ok {
 				mu.Lock()
-				secrets[id] = struct{}{}
+				secrets[sid] = struct{}{}
 				mu.Unlock()
 			}
 		}
